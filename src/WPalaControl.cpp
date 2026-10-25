@@ -1,4 +1,7 @@
 #include "WPalaControl.h"
+#ifdef JOTUL_MQTT_TLS
+#include <coredecls.h>
+#endif
 
 #ifdef ESP8266
 #define PALA_SERIAL Serial
@@ -58,6 +61,17 @@ void WPalaControl::myUSleep(unsigned long usecond) { delayMicroseconds(usecond);
 
 void WPalaControl::mqttConnectedCallback(MQTTMan *mqttMan, bool firstConnection)
 {
+#ifdef JOTUL_MQTT_TLS
+  // Fresh per TLS/MQTT connection: retained messages from prior sessions fail.
+  char session[33];
+  snprintf(session, sizeof(session), "%08lx%08lx%08lx%08lx",
+           (unsigned long)os_random(), (unsigned long)os_random(),
+           (unsigned long)os_random(), (unsigned long)os_random());
+  _mqttSession = session;
+  _mqttCommandPolicy.reset();
+  String sessionTopic = String(_mqttMan.getBaseTopic()) + F("/session");
+  mqttMan->publish(sessionTopic.c_str(), session, false);
+#endif
   // Subscribe command topic --------------------------------
   String cmdTopic = _mqttMan.getBaseTopic();
 
@@ -74,10 +88,12 @@ void WPalaControl::mqttConnectedCallback(MQTTMan *mqttMan, bool firstConnection)
     mqttMan->publish(cmdTopic.c_str(), ""); // make empty publish only for firstConnection
   mqttMan->subscribe(cmdTopic.c_str());
 
+#ifndef JOTUL_MQTT_TLS
   // Subscribe to update/install topic -----------------------
   String updateInstalltopic(_mqttMan.getBaseTopic());
   updateInstalltopic += F("/update/install");
   mqttMan->subscribe(updateInstalltopic.c_str());
+#endif
 
   // raise flag to publish Home Assistant discovery data
   _needPublishHassDiscovery = true;
@@ -111,8 +127,13 @@ void WPalaControl::mqttCallback(char *topic, uint8_t *payload, unsigned int leng
     String cmd;
     JsonDocument json;
 
+#ifdef JOTUL_MQTT_TLS
+    if (!acceptMqttRead(payload, length, cmd))
+      return;
+#else
     // convert payload to String cmd
     cmd.concat((char *)payload, length);
+#endif
 
     // replace '+' by ' '
     cmd.replace('+', ' ');
@@ -126,6 +147,7 @@ void WPalaControl::mqttCallback(char *topic, uint8_t *payload, unsigned int leng
     _mqttMan.publish(resTopic.c_str(), json);
   }
 
+#ifndef JOTUL_MQTT_TLS
   // if topic ends with "/update/install"
   const size_t topicLen = strlen(topic);
   if (topicLen >= 15 && memcmp_P(topic + topicLen - 15, PSTR("/update/install"), 15) == 0)
@@ -173,6 +195,7 @@ void WPalaControl::mqttCallback(char *topic, uint8_t *payload, unsigned int leng
     // publish result
     _mqttMan.publish(resTopic.c_str(), retMsg.c_str(), true);
   }
+#endif
 }
 
 void WPalaControl::mqttPublishStoveConnected(bool stoveConnected)
@@ -2239,7 +2262,11 @@ void WPalaControl::setConfigDefaultValues()
   _ha.uploadPeriod = 60;
 
   _ha.mqtt.type = HaMqttType::GenericJson;
+#ifdef JOTUL_MQTT_TLS
+  _ha.mqtt.port = 8883;
+#else
   _ha.mqtt.port = 1883;
+#endif
   _ha.mqtt.username[0] = 0;
   _ha.mqtt.password[0] = 0;
   strcpy_P(_ha.mqtt.generic.baseTopic, PSTR("$model$"));
@@ -2351,7 +2378,31 @@ bool WPalaControl::appInit(bool reInit /* = false */)
     // 512 gives a ×2 safety margin
     _mqttMan.setBufferSize(512);
     _mqttMan.setKeepAlive(_ha.uploadPeriod + 15);
+#ifdef JOTUL_MQTT_TLS
+    _mqttTlsClient.stop();
+    _mqttTrustAnchors.reset();
+    // Certificate is public trust material, provisioned locally, never a key.
+    File caFile = LittleFS.open("/mqtt-ca.pem", "r");
+    if (caFile && caFile.size() > 0 && caFile.size() <= 8192)
+    {
+      String pem = caFile.readString();
+      _mqttTrustAnchors.reset(new BearSSL::X509List(pem.c_str()));
+      if (_mqttTrustAnchors->getCount() == 0)
+        _mqttTrustAnchors.reset();
+    }
+    if (_mqttTrustAnchors)
+      _mqttTlsClient.setTrustAnchors(_mqttTrustAnchors.get());
+    _mqttTlsClient.setSSLVersion(BR_TLS12, BR_TLS12);
+    _mqttTlsClient.setTimeout(5000);
+    _mqttClockSynced = false;
+    settimeofday_cb([this]() { _mqttClockSynced = true; });
+    configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+    _mqttMan.setConnectionGuard([this]() { return mqttTlsReady(); });
+    // Hostname is passed to BearSSL for chain, validity and hostname checks.
+    _mqttMan.setClient(_mqttTlsClient).setServer(_ha.hostname, _ha.mqtt.port);
+#else
     _mqttMan.setClient(_wifiClient).setServer(_ha.hostname, _ha.mqtt.port);
+#endif
     _mqttMan.setBaseTopic(_ha.mqtt.generic.baseTopic);
     _mqttMan.setConnectedCallback([this](MQTTMan *mqttMan, bool firstConnection)
                                   { mqttConnectedCallback(mqttMan, firstConnection); });
@@ -2627,6 +2678,7 @@ void WPalaControl::appRun()
   {
     _mqttMan.loop();
 
+#ifndef JOTUL_MQTT_TLS
     // if Home Assistant discovery enabled and publish is needed (and publish is successful)
     if (_ha.mqtt.hassDiscoveryEnabled && _needPublishHassDiscovery && mqttPublishHassDiscovery())
     {
@@ -2636,6 +2688,7 @@ void WPalaControl::appRun()
 
     if (_needPublishUpdate && mqttPublishUpdate(_mqttMan))
       _needPublishUpdate = false;
+#endif
   }
 
   if (_needPublish)
@@ -2656,3 +2709,39 @@ WPalaControl::WPalaControl() : Application(CustomApp)
   pinMode(15, OUTPUT); // set TX PIN to OUTPUT HIGH to unlock bus during WiFi connection
   digitalWrite(15, HIGH);
 }
+
+#ifdef JOTUL_MQTT_TLS
+bool WPalaControl::mqttTlsReady() const
+{
+  // Fail closed: no TLS connection before a plausible clock and trust anchor.
+  // SNTP is unauthenticated; deploy on a trusted local network.
+  return WiFi.isConnected() && _mqttClockSynced && _mqttTrustAnchors &&
+         _ha.mqtt.username[0] && _ha.mqtt.password[0] && _ha.hostname[0] &&
+         _ha.mqtt.port > 0 && _ha.mqtt.port <= 65535 &&
+         time(nullptr) >= 1767225600; // 2026-01-01 UTC
+}
+
+bool WPalaControl::acceptMqttRead(const uint8_t *payload, unsigned int length, String &command)
+{
+  if (!mqttTlsReady() || length == 0 || length > 256)
+    return false;
+  JsonDocument envelope;
+  if (deserializeJson(envelope, payload, length, DeserializationOption::NestingLimit(2)))
+    return false;
+  if (!envelope.is<JsonObject>() || !envelope["session"].is<const char *>() ||
+      !envelope["seq"].is<uint32_t>() || !envelope["ts"].is<uint32_t>() ||
+      !envelope["command"].is<const char *>())
+    return false;
+  JsonString session = envelope["session"].as<JsonString>();
+  JsonString requested = envelope["command"].as<JsonString>();
+  if (_mqttCommandPolicy.accept(session.c_str(), session.size(),
+      _mqttSession.c_str(), _mqttSession.length(), envelope["seq"].as<uint32_t>(),
+      envelope["ts"].as<uint32_t>(), time(nullptr), millis(),
+      requested.c_str(), requested.size()))
+  {
+    command = requested.c_str();
+    return true;
+  }
+  return false;
+}
+#endif

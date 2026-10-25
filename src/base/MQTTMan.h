@@ -31,6 +31,11 @@ private:
     ConnectedCallback _connectedCallBack = nullptr;
     DisconnectedCallback _disconnectedCallBack = nullptr;
 
+#ifdef JOTUL_MQTT_TLS
+    std::function<bool()> _connectionGuard;
+    bool _connectionRequested = false;
+    unsigned long _guardRetryMillis = 0;
+#endif
     bool connect(bool firstConnection);
 
 public:
@@ -39,6 +44,9 @@ public:
     MQTTMan &setBaseTopic(const char *baseTopicTemplate);
     const char *getBaseTopic() const;
 
+#ifdef JOTUL_MQTT_TLS
+    void setConnectionGuard(std::function<bool()> guard) { _connectionGuard = guard; }
+#endif
     using PubSubClient::setClient;
     using PubSubClient::setServer;
     using PubSubClient::setKeepAlive;

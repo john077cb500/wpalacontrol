@@ -210,3 +210,11 @@ MQTT infos published every "Upload Period":
 - `FDR`: feeder
 - `DP_TARGET`: delta pressure target
 - `DP_PRESS`: actual delta pressure
+
+### Experimental Jotul MQTT/TLS branch
+
+An opt-in ESP8266 build based on 3.7.6 is documented in
+[docs/JOTUL-MQTT-TLS.md](docs/JOTUL-MQTT-TLS.md). It requires verified TLS and
+synchronized time, permits protected read-only MQTT commands, and disables MQTT
+firmware updates. It is not an official release or a hardware compatibility
+validation. The default build remains unchanged.

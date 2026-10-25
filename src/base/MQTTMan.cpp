@@ -92,6 +92,10 @@ const char *MQTTMan::getBaseTopic() const
 
 bool MQTTMan::connect(bool firstConnection)
 {
+#ifdef JOTUL_MQTT_TLS
+    if (!_connectionGuard || !_connectionGuard())
+        return false;
+#endif
     // generate clientID
     char clientID[sizeof(CUSTOM_APP_MODEL) + 9];
     snprintf_P(clientID, sizeof(clientID), PSTR(CUSTOM_APP_MODEL "%s"), Core::getSerialNumber());
@@ -158,11 +162,19 @@ bool MQTTMan::connect(const char *username, const char *password /* = nullptr */
     else
         _password[0] = 0;
 
+#ifdef JOTUL_MQTT_TLS
+    _connectionRequested = true;
+    _guardRetryMillis = millis();
+#endif
     return connect(true);
 }
 
 void MQTTMan::disconnect()
 {
+#ifdef JOTUL_MQTT_TLS
+    _connectionRequested = false;
+    _needMqttReconnect = false;
+#endif
     // publish disconnected just before disconnect...
     if (_connectedAndWillTopic[0])
         publish(_connectedAndWillTopic, "0", true);
@@ -248,6 +260,22 @@ int8_t MQTTMan::getLastDiscoState() const
 
 bool MQTTMan::loop()
 {
+#ifdef JOTUL_MQTT_TLS
+    // Initial guard failure leaves PubSubClient disconnected: retry in the loop,
+    // never in a Ticker callback and without blocking on SNTP.
+    if (_connectionRequested && state() == MQTT_DISCONNECTED &&
+        millis() - _guardRetryMillis >= 20000)
+    {
+        _guardRetryMillis = millis();
+        connect(_connectionCount == 0);
+    }
+    if (_connectionRequested && _connectionGuard && !_connectionGuard())
+    {
+        if (connected())
+            PubSubClient::disconnect();
+        return false;
+    }
+#endif
     if (state() != MQTT_DISCONNECTED)
     {
         // evaluate connection status and call disconnected callback if needed

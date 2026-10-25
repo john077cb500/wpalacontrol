@@ -73,6 +73,13 @@
 #define _DEBUG_SUFFIX ""
 #endif
 
+#ifdef JOTUL_MQTT_TLS
+#ifndef ESP8266
+#error "Jotul MQTT/TLS experiment requires ESP8266"
+#endif
+#define VERSION VERSION_NUMBER "-jotul-mqtt-tls-experimental" _DEBUG_SUFFIX
+#else
 #define VERSION VERSION_NUMBER _DEV_SUFFIX _DEBUG_SUFFIX
+#endif
 
 #endif

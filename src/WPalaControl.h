@@ -9,6 +9,12 @@
 
 #include <Palazzetti.h>
 #include <WiFiUdp.h>
+#ifdef JOTUL_MQTT_TLS
+#include <WiFiClientSecureBearSSL.h>
+#include <memory>
+#include <time.h>
+#include "JotulCommandPolicy.h"
+#endif
 
 class WPalaControl : public Application
 {
@@ -65,6 +71,15 @@ private:
   HomeAutomation _ha;
   int _haSendResult = 0;
   WiFiClient _wifiClient;
+#ifdef JOTUL_MQTT_TLS
+  std::unique_ptr<BearSSL::X509List> _mqttTrustAnchors;
+  BearSSL::WiFiClientSecure _mqttTlsClient;
+  String _mqttSession;
+  JotulCommandPolicy _mqttCommandPolicy;
+  bool _mqttClockSynced = false;
+  bool mqttTlsReady() const;
+  bool acceptMqttRead(const uint8_t *payload, unsigned int length, String &command);
+#endif
   MQTTMan _mqttMan;
   SSEServer _sse;
   WiFiUDP _udpServer;
